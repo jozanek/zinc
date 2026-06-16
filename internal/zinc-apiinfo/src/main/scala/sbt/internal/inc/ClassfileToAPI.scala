@@ -16,9 +16,17 @@ package inc
 import java.io.{ ByteArrayInputStream, DataInputStream }
 import java.lang.reflect.Modifier
 import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
 import xsbti.api
 import xsbti.api.SafeLazyProxy
-import sbt.internal.inc.classfile.{ AttributeInfo, ClassFile, FieldOrMethodInfo }
+import sbt.internal.inc.classfile.{
+  AttributeInfo,
+  ClassFile,
+  FieldOrMethodInfo,
+  InnerClassInfo,
+  SignatureParser
+}
+import sbt.internal.inc.classfile.SignatureModel._
 import sbt.util.Logger
 
 /**
@@ -29,13 +37,16 @@ import sbt.util.Logger
  *
  * It mirrors the structure [[ClassToAPI]] produces (a class + module `ClassLike` pair, declared
  * members split into static/instance) and reuses [[ClassToAPI]]'s access/modifier/type helpers, so
- * the result slots into the same analysis. Member types are erased (from JVM descriptors), but
- * generic signatures, checked exceptions, and declared annotations are folded in conservatively (raw
- * `Signature` string / `throws` and annotation *type* names — not annotation element values), so a
- * change to any of them still changes the hash. Enum children, type parameters, and inherited
- * members are not modelled — see the "Phase 2" scope in docs/design/classfile-based-java-api.md. The
- * output need not match the reflection-derived API byte-for-byte; it only needs to be deterministic
- * and to change when the class's public shape changes.
+ * the result slots into the same analysis. Member types use real generics parsed from the `Signature`
+ * attribute ([[SignatureParser]]), falling back to erased JVM descriptors when it is absent; class
+ * and method type parameters and enum children are modelled. Checked exceptions (`throws`) and
+ * declared annotations (type + element values) are folded into a synthetic annotation so changes are
+ * detected. Inherited public members are recovered by reading parent classfiles via the
+ * `resolveParent` resolver (bytes only — no class loading), so this stays immune to the module /
+ * classpath issues that motivated the classfile path. The output need not match the reflection-derived
+ * API byte-for-byte (e.g. type-variable names are unqualified, and wildcards keep only their bound);
+ * it only needs to be deterministic and to change when the class's public shape changes. See
+ * docs/design/classfile-based-java-api.md.
  */
 object ClassfileToAPI {
   import api.DefinitionType.{ ClassDef, Module, Trait }
@@ -45,14 +56,15 @@ object ClassfileToAPI {
   private val noTypes = new Array[api.Type](0)
   private val noStrings = new Array[String](0)
   private val noDefinitions = new Array[api.ClassDefinition](0)
+  private val AccEnum = 0x4000 // ACC_ENUM; not exposed by java.lang.reflect.Modifier
+  private val AccVarargs = 0x0080 // ACC_VARARGS (on a method)
 
   private def strict[T <: AnyRef](t: T): api.Lazy[T] = SafeLazyProxy.strict(t)
 
-  // A synthetic annotation that folds public-shape signals the erased descriptor can't capture —
-  // the raw generic Signature, checked-exception (throws) types, and declared annotation types —
-  // into the API, so changing any of them still changes the hash. Conservative Phase-2 fold (raw
-  // Signature string and exception/annotation *type* names, not annotation element values); proper
-  // modelling is Phase 3.
+  // A synthetic annotation that folds public-shape signals not fully carried by the modelled member
+  // types — checked-exception (throws) types, declared annotations (type + element values), and the
+  // raw Signature string (which captures generic details the lossy type mapping drops) — into the
+  // API, so changing any of them changes the hash.
   private val SyntheticRef = ClassToAPI.reference("xsbti.api.ClassfileApi")
 
   private def syntheticAnnotations(parts: (String, Iterable[String])*): Array[api.Annotation] = {
@@ -77,36 +89,45 @@ object ClassfileToAPI {
             val classConstant = cf.constantPool(in.readUnsignedShort())
             cf.constantPool(classConstant.nameIndex).value.fold("")(_.toString).replace('/', '.')
           }
-        } catch { case _: Throwable => Nil }
+        } catch { case NonFatal(_) => Nil }
     }
 
-  /** Declared annotation type names from RuntimeVisible/Invisible annotations (JVMS 4.7.16). */
-  private def annotationTypeNames(cf: ClassFile, attrs: Seq[AttributeInfo]): Seq[String] = {
-    val names = ArrayBuffer.empty[String]
+  /**
+   * Declared annotations rendered as `type(name=value,...)` strings, from RuntimeVisible/Invisible
+   * attributes (JVMS 4.7.16) — capturing element values too, so `@A("a")` differs from `@A("b")`.
+   */
+  private def annotationStrings(cf: ClassFile, attrs: Seq[AttributeInfo]): Seq[String] = {
+    val out = ArrayBuffer.empty[String]
     for (a <- attrs if a.isRuntimeVisibleAnnotations || a.isRuntimeInvisibleAnnotations) {
       try {
         val in = new DataInputStream(new ByteArrayInputStream(a.value))
-        def utf8(i: Int): String = cf.constantPool(i).value.fold("")(_.toString)
-        def skipElementValue(): Unit =
+        def poolStr(i: Int): String = cf.constantPool(i).value.fold("")(_.toString)
+        // Length-prefix each composed value so concatenation can't collide (e.g. {"a,b","c"} vs
+        // {"a","b,c"}); we only need distinct, deterministic strings for hashing, not parseability.
+        def lp(s: String): String = s.length.toString + ":" + s
+        def elementValue(): String =
           in.readUnsignedByte().toChar match {
-            case 'e' => in.readUnsignedShort(); in.readUnsignedShort()
-            case 'c' => in.readUnsignedShort()
-            case '@' => readAnnotation()
+            case 'e' => poolStr(in.readUnsignedShort()) + "." + poolStr(in.readUnsignedShort())
+            case 'c' => poolStr(in.readUnsignedShort())
+            case '@' => annotationString()
             case '[' =>
               val n = in.readUnsignedShort()
-              (0 until n).foreach(_ => skipElementValue())
-            case _ => in.readUnsignedShort()
+              (0 until n).map(_ => lp(elementValue())).mkString("[", "", "]")
+            case _ => poolStr(in.readUnsignedShort())
           }
-        def readAnnotation(): Unit = {
-          names += utf8(in.readUnsignedShort()).stripPrefix("L").stripSuffix(";").replace('/', '.')
+        def annotationString(): String = {
+          val tpe =
+            poolStr(in.readUnsignedShort()).stripPrefix("L").stripSuffix(";").replace('/', '.')
           val pairs = in.readUnsignedShort()
-          (0 until pairs).foreach { _ => in.readUnsignedShort(); skipElementValue() }
+          val args =
+            (0 until pairs).map(_ => lp(poolStr(in.readUnsignedShort()) + "=" + elementValue()))
+          if (args.isEmpty) tpe else args.mkString(tpe + "(", "", ")")
         }
         val num = in.readUnsignedShort()
-        (0 until num).foreach(_ => readAnnotation())
-      } catch { case _: Throwable => () }
+        (0 until num).foreach(_ => out += annotationString())
+      } catch { case NonFatal(_) => () }
     }
-    names.toSeq
+    out.toSeq
   }
 
   /**
@@ -116,18 +137,26 @@ object ClassfileToAPI {
    */
   def process(
       named: Seq[(String, ClassFile)],
+      resolveParent: String => Option[ClassFile] = _ => None,
       log: Logger = Logger.Null
   ): (Seq[api.ClassLike], Seq[String]) = {
+    // Cache parsed parents across the batch so e.g. java.lang.Object is read once.
+    val cache = scala.collection.mutable.Map.empty[String, Option[ClassFile]]
+    val cachedResolve = (n: String) => cache.getOrElseUpdate(n, resolveParent(n))
     val classApis = ArrayBuffer.empty[api.ClassLike]
     val mainClasses = ArrayBuffer.empty[String]
     for ((name, cf) <- named) {
-      classApis ++= classLikes(name, cf)
+      classApis ++= classLikes(name, cf, cachedResolve)
       if (cf.methods.exists(_.isMain)) mainClasses += name
     }
     (classApis.toSeq, mainClasses.toSeq)
   }
 
-  private def classLikes(name: String, cf: ClassFile): Seq[api.ClassLike] = {
+  private def classLikes(
+      name: String,
+      cf: ClassFile,
+      resolveParent: String => Option[ClassFile]
+  ): Seq[api.ClassLike] = {
     // Use the binary name's package (last '.' before the simple/binary name); the canonical name's
     // dots would mis-split nested classes (e.g. "pkg.Outer.Inner").
     val enclPkg = ClassToAPI.packageAndName(cf.className)._1
@@ -145,26 +174,48 @@ object ClassfileToAPI {
     }
     val (staticFields, instanceFields) = fields.partition(_._1)
     val (staticMethods, instanceMethods) = methods.partition(_._1)
+    // Direct member classes are listed among the outer's declared members, like ClassToAPI: a static
+    // nested class on the module, an instance inner class on the class. (Local/anonymous classes have
+    // no innerName and are excluded.) Built from the InnerClasses attribute — no class loading.
+    val (staticNested, instanceNested) =
+      memberClasses(cf, publicOnly = false).partition(_.isStatic)
     val instanceDeclared: Array[api.ClassDefinition] =
-      (instanceFields.map(_._2) ++ instanceMethods.map(_._2)).toArray
+      (instanceFields.map(_._2) ++ instanceMethods.map(_._2) ++
+        instanceNested.flatMap(nestedClassDefs(name, _, enclPkg))).toArray
     val staticDeclared: Array[api.ClassDefinition] =
-      (staticFields.map(_._2) ++ staticMethods.map(_._2)).toArray
+      (staticFields.map(_._2) ++ staticMethods.map(_._2) ++
+        staticNested.flatMap(nestedClassDefs(name, _, enclPkg))).toArray
 
-    val parents: Array[api.Type] =
-      (cf.superClassName +: cf.interfaceNames.toIndexedSeq)
-        .filter(_.nonEmpty)
-        .map(ClassToAPI.reference)
-        .toArray
+    val classSigStr = cf.attributes.find(_.isSignature).map(cf.stringValue)
+    val classSig = classSigStr.flatMap(SignatureParser.classSignature)
+    val (typeParams, parents): (Array[api.TypeParameter], Array[api.Type]) = classSig match {
+      case Some(cs) =>
+        (
+          cs.typeParams.map(toTypeParam).toArray,
+          (cs.superclass +: cs.interfaces).map(toType).toArray
+        )
+      case None =>
+        val erased = (cf.superClassName +: cf.interfaceNames.toIndexedSeq)
+          .filter(_.nonEmpty)
+          .map(ClassToAPI.reference)
+          .toArray
+        (noTypeParameters, erased)
+    }
 
     val classAnnots = syntheticAnnotations(
-      "signature" -> cf.attributes.find(_.isSignature).map(cf.stringValue).toList,
-      "annotations" -> annotationTypeNames(cf, cf.attributes.toIndexedSeq)
+      "signature" -> rawSignature(classSigStr),
+      "annotations" -> annotationStrings(cf, cf.attributes.toIndexedSeq)
     )
 
+    // ClassToAPI models a Java enum's sealed children as a single self-reference; mirror that.
+    val children: Array[api.Type] =
+      if ((cf.accessFlags & AccEnum) != 0) Array(ClassToAPI.reference(name)) else noTypes
+
+    val (instanceInherited, staticInherited) = collectInherited(cf, resolveParent)
     val instanceStructure =
-      api.Structure.of(strict(parents), strict(instanceDeclared), strict(noDefinitions))
+      api.Structure.of(strict(parents), strict(instanceDeclared), strict(instanceInherited))
     val staticStructure =
-      api.Structure.of(strict(noTypes), strict(staticDeclared), strict(noDefinitions))
+      api.Structure.of(strict(noTypes), strict(staticDeclared), strict(staticInherited))
 
     val cls = api.ClassLike.of(
       name,
@@ -175,9 +226,9 @@ object ClassfileToAPI {
       strict(ClassToAPI.Empty),
       strict(instanceStructure),
       noStrings,
-      noTypes,
+      children,
       topLevel,
-      noTypeParameters
+      typeParams
     )
     val stat = api.ClassLike.of(
       name,
@@ -208,18 +259,20 @@ object ClassfileToAPI {
     val constant: Option[AnyRef] =
       if (mods.isFinal)
         (try cf.constantValue(name)
-        catch { case _: Throwable => None })
+        catch { case NonFatal(_) => None })
       else None
+    val sigStr = f.attributes.find(_.isSignature).map(cf.stringValue)
+    val sig = sigStr.flatMap(SignatureParser.fieldSignature)
     val tpe = constant match {
       case Some(value) =>
         val tag = name + "$" + f.descriptor.getOrElse("") + "$" + value
         api.Singleton.of(ClassToAPI.pathFromStrings(cf.className.split("\\.").toIndexedSeq :+ tag))
-      case None => parseFieldType(f.descriptor.getOrElse("V"))
+      case None => sig.map(toType).getOrElse(parseFieldType(f.descriptor.getOrElse("V")))
     }
     val acc = ClassToAPI.access(f.accessFlags, enclPkg)
     val annots = syntheticAnnotations(
-      "signature" -> f.attributes.find(_.isSignature).map(cf.stringValue).toList,
-      "annotations" -> annotationTypeNames(cf, f.attributes)
+      "signature" -> rawSignature(sigStr),
+      "annotations" -> annotationStrings(cf, f.attributes)
     )
     val fieldLike =
       if (mods.isFinal) api.Val.of(name, acc, mods, annots, tpe)
@@ -234,27 +287,240 @@ object ClassfileToAPI {
       binaryName: String,
       enclPkg: Option[String]
   ): (Boolean, api.ClassDefinition) = {
-    val (paramTypes, returnType) = parseMethodType(m.descriptor.getOrElse("()V"))
-    val params = paramTypes.map(t =>
-      api.MethodParameter.of("", t, false, api.ParameterModifier.Plain)
-    )
+    val sigStr = m.attributes.find(_.isSignature).map(cf.stringValue)
+    val sig = sigStr.flatMap(SignatureParser.methodSignature)
+    val (paramTypes, rawReturn, typeParams): (Array[api.Type], api.Type, Array[api.TypeParameter]) =
+      sig match {
+        case Some(ms) =>
+          (ms.params.map(toType).toArray, toType(ms.result), ms.typeParams.map(toTypeParam).toArray)
+        case None =>
+          val (ps, ret) = parseMethodType(m.descriptor.getOrElse("()V"))
+          (ps, ret, noTypeParameters)
+      }
+    val isCtor = m.name.contains("<init>")
+    // ClassToAPI uses Empty (not Unit) for a constructor's "return type".
+    val returnType = if (isCtor) ClassToAPI.Empty else rawReturn
+    // ACC_VARARGS marks the trailing array parameter as repeated (`T...` vs `T[]`).
+    val isVarargs = (m.accessFlags & AccVarargs) != 0
+    val lastParam = paramTypes.length - 1
+    val params = paramTypes.zipWithIndex.map {
+      case (t, i) =>
+        val modifier =
+          if (isVarargs && i == lastParam) api.ParameterModifier.Repeated
+          else api.ParameterModifier.Plain
+        api.MethodParameter.of("", t, false, modifier)
+    }
     val paramList = api.ParameterList.of(params, false)
     // Match ClassToAPI.uniqueConstructorName, which uses the binary (not canonical) class name.
     val name =
-      if (m.name.contains("<init>")) s"${binaryName.replace('.', ';')};init;"
+      if (isCtor) s"${binaryName.replace('.', ';')};init;"
       else m.name.getOrElse("")
     val acc = ClassToAPI.access(m.accessFlags, enclPkg)
     val mods = ClassToAPI.modifiers(m.accessFlags)
     val annots = syntheticAnnotations(
-      "signature" -> m.attributes.find(_.isSignature).map(cf.stringValue).toList,
+      "signature" -> rawSignature(sigStr),
       "throws" -> exceptionNames(cf, m.attributes),
-      "annotations" -> annotationTypeNames(cf, m.attributes)
+      "annotations" -> annotationStrings(cf, m.attributes)
     )
-    val d = api.Def.of(name, acc, mods, annots, noTypeParameters, Array(paramList), returnType)
+    val d = api.Def.of(name, acc, mods, annots, typeParams, Array(paramList), returnType)
     (m.isStatic, d)
   }
 
+  // A direct member class, listed among the outer class's declared members as a class + module
+  // ClassLikeDef pair (canonical name), mirroring ClassToAPI — so adding/removing a nested class
+  // changes the outer's API. Built from the InnerClasses attribute alone; the nested class's own
+  // ClassLike carries its full structure and type parameters, so the reference here uses none.
+  private def nestedClassDefs(
+      outerName: String,
+      info: InnerClassInfo,
+      enclPkg: Option[String]
+  ): Seq[api.ClassDefinition] = {
+    val canonical = outerName + "." + info.innerName.getOrElse("")
+    val acc = ClassToAPI.access(info.accessFlags, enclPkg)
+    val mods = ClassToAPI.modifiers(info.accessFlags)
+    val tpe = if (Modifier.isInterface(info.accessFlags)) Trait else ClassDef
+    Seq(
+      api.ClassLikeDef.of(canonical, acc, mods, noAnnotations, noTypeParameters, tpe),
+      api.ClassLikeDef.of(canonical, acc, mods, noAnnotations, noTypeParameters, Module)
+    )
+  }
+
+  // The dotted source (canonical) name of a class from its own InnerClasses attribute — the
+  // classfile analogue of Class.getCanonicalName — used to name inherited member classes consistently
+  // with ClassToAPI. Falls back to the binary name (e.g. for top-level/local classes).
+  private def canonicalName(cf: ClassFile): String = {
+    val inners = cf.innerClasses
+    def go(binaryName: String): String =
+      inners.find(_.innerClassName == binaryName) match {
+        case Some(info) if info.outerClassName.nonEmpty && info.innerName.isDefined =>
+          go(info.outerClassName) + "." + info.innerName.get
+        case _ => binaryName
+      }
+    go(cf.className)
+  }
+
+  /** A class's own named direct member classes, from the InnerClasses attribute (no class loading). */
+  private def memberClasses(cf: ClassFile, publicOnly: Boolean): Seq[InnerClassInfo] =
+    cf.innerClasses.toIndexedSeq.filter(i =>
+      i.outerClassName == cf.className && i.innerName.isDefined && (!publicOnly || i.isPublic)
+    )
+
+  // Erased names of supertypes this class references WITH type arguments (from the Signature
+  // attribute). ClassToAPI collects inherited member classes only from raw (non-generic) supertypes —
+  // a generic supertype surfaces as a ParameterizedType that its inner-class walk filters out — so we
+  // mirror that, otherwise an enum would inherit java.lang.Enum.EnumDesc that reflection never lists.
+  // (Inherited methods/fields are unaffected: those come from every supertype in both paths.)
+  // A supertype is "generic" if its outer OR any inner suffix carries type arguments — e.g.
+  // `Outer<String>.Inner` is a parameterized type even though `Inner` itself has none. The key is the
+  // erased ($-joined) binary name so it matches superTypeNames/cf.superClassName ("Outer$Inner").
+  private def genericSuperNames(cf: ClassFile): Set[String] =
+    cf.attributes
+      .find(_.isSignature)
+      .map(cf.stringValue)
+      .flatMap(SignatureParser.classSignature) match {
+      case Some(cs) =>
+        (cs.superclass +: cs.interfaces).collect {
+          case SigClass(n, args, inners) if args.nonEmpty || inners.exists(_.args.nonEmpty) =>
+            (n +: inners.map(_.name)).mkString("$")
+        }.toSet
+      case None => Set.empty
+    }
+
+  // Supertypes whose members are inherited. An interface's classfile lists Object as its super_class,
+  // but it does not inherit Object's members (reflection's getMethods agrees), so for interfaces we
+  // walk only the super-interfaces.
+  private def superTypeNames(cf: ClassFile): Seq[String] =
+    (if (Modifier.isInterface(cf.accessFlags)) cf.interfaceNames.toIndexedSeq
+     else cf.superClassName +: cf.interfaceNames.toIndexedSeq).filter(_.nonEmpty)
+
+  /**
+   * Public members inherited from super + interfaces (transitively), as (instance, static) — read
+   * from parent classfiles via `resolveParent` (byte-only, no class loading). Mirrors reflection's
+   * `getMethods`/`getFields`: most-derived wins (dedup by name+descriptor for methods, name for
+   * fields), constructors/initializers and static interface methods excluded. Missing parents are
+   * skipped (fail-soft).
+   */
+  private def collectInherited(
+      cf: ClassFile,
+      resolveParent: String => Option[ClassFile]
+  ): (Array[api.ClassDefinition], Array[api.ClassDefinition]) = {
+    val seenMethods = scala.collection.mutable.Set.empty[(String, String)]
+    val seenFields = scala.collection.mutable.Set.empty[String]
+    val seenNested = scala.collection.mutable.Set.empty[String]
+    val ownCanonical = canonicalName(cf)
+    // Seed with the class's own members so overridden/hidden inherited ones are excluded.
+    cf.methods.foreach(m => seenMethods += ((m.name.getOrElse(""), m.descriptor.getOrElse(""))))
+    cf.fields.foreach(f => seenFields += f.name.getOrElse(""))
+    memberClasses(cf, publicOnly = false)
+      .foreach(i => seenNested += ownCanonical + "." + i.innerName.getOrElse(""))
+    val instance = ArrayBuffer.empty[api.ClassDefinition]
+    val static = ArrayBuffer.empty[api.ClassDefinition]
+    val visited = scala.collection.mutable.Set.empty[String]
+    // (parent binary name, whether to collect that parent's member classes — false for a generically
+    // referenced parent, matching reflection). Methods/fields are always collected.
+    val queue = scala.collection.mutable.Queue.empty[(String, Boolean)]
+    val rootGeneric = genericSuperNames(cf)
+    queue ++= superTypeNames(cf).map(n => (n, !rootGeneric.contains(n)))
+    while (queue.nonEmpty) {
+      val (parentName, collectNested) = queue.dequeue()
+      if (visited.add(parentName)) resolveParent(parentName).foreach { pcf =>
+        val penc = ClassToAPI.packageAndName(pcf.className)._1
+        val parentIsInterface = Modifier.isInterface(pcf.accessFlags)
+        for (m <- pcf.methods) {
+          val mname = m.name.getOrElse("")
+          if (
+            m.isPublic && mname != "<init>" && mname != "<clinit>" &&
+            !(parentIsInterface && m.isStatic)
+          ) {
+            if (seenMethods.add((mname, m.descriptor.getOrElse("")))) {
+              val (isStat, d) = methodDef(pcf, m, pcf.className, penc)
+              if (isStat) static += d else instance += d
+            }
+          }
+        }
+        for (f <- pcf.fields) {
+          if (f.isPublic && seenFields.add(f.name.getOrElse(""))) {
+            val (isStat, fl) = fieldDef(pcf, f, penc)
+            if (isStat) static += fl else instance += fl
+          }
+        }
+        // Public member classes of a raw (non-generic) parent are inherited too (ClassToAPI lists them).
+        if (collectNested) {
+          val parentCanonical = canonicalName(pcf)
+          for (i <- memberClasses(pcf, publicOnly = true)) {
+            if (seenNested.add(parentCanonical + "." + i.innerName.getOrElse(""))) {
+              val defs = nestedClassDefs(parentCanonical, i, penc)
+              if (i.isStatic) static ++= defs else instance ++= defs
+            }
+          }
+        }
+        val parentGeneric = genericSuperNames(pcf)
+        queue ++= superTypeNames(pcf).map(n => (n, !parentGeneric.contains(n)))
+      }
+    }
+    (instance.toArray, static.toArray)
+  }
+
   private val ObjectRef = ClassToAPI.reference("java.lang.Object")
+
+  // --- Generic signatures (JVMS 4.7.9) parsed by SignatureParser, mapped to api types ----------
+
+  private def toType(t: SigType): api.Type =
+    t match {
+      case SigPrimitive(tag) => ClassToAPI.primitive(primitiveName(tag))
+      case SigVoid           => ClassToAPI.primitive("void")
+      case SigArray(elem)    => ClassToAPI.array(toType(elem))
+      case SigVar(varName)   => api.ParameterRef.of(varName)
+      case SigClass(clsName, args, inners) =>
+        val full = (clsName +: inners.map(_.name)).mkString(".")
+        val all = (args ++ inners.flatMap(_.args)).map(toTypeArg).toArray
+        if (all.isEmpty) ClassToAPI.reference(full)
+        else api.Parameterized.of(ClassToAPI.reference(full), all)
+    }
+
+  // A wildcard's bound is kept (so `List<? extends Number>` differs from `List<? extends String>`);
+  // the extends/super direction is not separately modelled. Unbounded `*` -> `_`, as ClassToAPI does.
+  private def toTypeArg(a: SigArg): api.Type =
+    a match {
+      case SigWildcard        => ClassToAPI.reference("_")
+      case SigBounded(_, tpe) => toType(tpe)
+    }
+
+  private def toTypeParam(p: SigTypeParam): api.TypeParameter =
+    api.TypeParameter.of(
+      p.name,
+      noAnnotations,
+      noTypeParameters,
+      api.Variance.Invariant,
+      ClassToAPI.NothingRef,
+      api.Structure.of(
+        strict(p.bounds.map(toType).toArray),
+        strict(noDefinitions),
+        strict(noDefinitions)
+      )
+    )
+
+  private def primitiveName(tag: Char): String =
+    tag match {
+      case 'B' => "byte"
+      case 'C' => "char"
+      case 'D' => "double"
+      case 'F' => "float"
+      case 'I' => "int"
+      case 'J' => "long"
+      case 'S' => "short"
+      case 'Z' => "boolean"
+      case _   => "void"
+    }
+
+  // The raw Signature attribute is folded into the synthetic annotation whenever it is present —
+  // not only when parsing fails. The mapped `api.Type`s carry the structure (declared/inherited
+  // members), but they are intentionally lossy: `toTypeArg` drops wildcard variance (so
+  // `List<? extends Number>` and `List<? super Number>` map to the same type) and the parsed
+  // generic `throws` are not modelled (only the erased `Exceptions` attribute is). Folding the raw
+  // signature string guarantees the hash still changes on those generic-only differences, so
+  // name-hashing never under-invalidates. Costs nothing for non-generic members (no attribute).
+  private def rawSignature(raw: Option[String]): Iterable[String] = raw.toList
 
   /** Parses a JVM field descriptor (JVMS 4.3.2) into an erased [[xsbti.api.Type]]. */
   private[inc] def parseFieldType(descriptor: String): api.Type = parseType(descriptor, 0)._1

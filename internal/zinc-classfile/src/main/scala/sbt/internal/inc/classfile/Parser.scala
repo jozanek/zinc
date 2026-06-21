@@ -155,8 +155,21 @@ private[sbt] object Parser {
               log.warn(s"couldn't parse annotations in $readableName ($re)")
               List()
           }
+        // Generic type arguments and type-parameter bounds are erased out of descriptors and the
+        // constant pool, so a class used only in a generic position (e.g. `Foo` in `List<Foo>`) is
+        // otherwise invisible to dependency analysis (sbt/zinc#147). Its name survives only in the
+        // Signature attribute, which we scan here. Like annotation parsing, this is comparatively new
+        // so we only warn rather than fail compilation if it blows up.
+        def signatureReferencesCarefully =
+          try signatureReferences
+          catch {
+            case re: RuntimeException =>
+              log.warn(s"couldn't parse generic signatures in $readableName ($re)")
+              List()
+          }
         // the other aspects of classfile.Parser are long battle-tested
-        (classConstantReferences ++ fieldTypes ++ methodTypes ++ annotationsReferencesCarefully).toSet
+        (classConstantReferences ++ fieldTypes ++ methodTypes ++ annotationsReferencesCarefully ++
+          signatureReferencesCarefully).toSet
       }
 
       private def getTypes(fieldsOrMethods: Array[FieldOrMethodInfo]) =
@@ -212,6 +225,16 @@ private[sbt] object Parser {
             // we've already used `slashesToDots`, but we still need to drop the `L` and the semicolon
             result.map(name => name.slice(1, name.length - 1))
           }.toList
+      }
+
+      // Class references recovered from every Signature attribute (JVMS 4.7.9) on the class itself
+      // and on each field and method. These carry the generic type information (type arguments,
+      // bounds, parameterized supertypes) that erasure strips from the descriptors (sbt/zinc#147).
+      private def signatureReferences: List[String] = {
+        val signatureAttributes =
+          (attributes ++ fields.flatMap(_.attributes) ++ methods.flatMap(_.attributes))
+            .filter(_.isSignature)
+        signatureAttributes.flatMap(a => signatureClassTypes(stringValue(a))).toList
       }
 
       private def classConstantReferences =
@@ -321,5 +344,141 @@ private[sbt] object Parser {
       }
     }
     toTypes(descriptor.getOrElse(""), Nil)
+  }
+
+  /**
+   * Extracts the referenced class names from a generic signature (JVMS 4.7.9) — a ClassSignature,
+   * MethodSignature, or FieldTypeSignature string. Erasure removes generic type arguments and
+   * type-parameter bounds from the field/method descriptors and the constant pool, so a class used
+   * only in such a position (e.g. `Foo` in `List<Foo>`, or the bound in `<T extends Foo>`) is
+   * otherwise invisible to dependency analysis (sbt/zinc#147); its name survives only here.
+   *
+   * Returns dotted binary class names (`java.util.List`, `p.Outer$Inner`); type variables (`T...;`)
+   * and primitives are excluded. We only need the *set* of referenced names, not the type structure,
+   * so this is a focused scan rather than a full signature-to-type model. The asymmetry that makes
+   * the scan safe: over-recording a name only causes a harmless extra recompile, whereas the bug
+   * being fixed is under-recording (a missed recompile that yields a stale, inconsistent build).
+   *
+   * Scope is declaration signatures only; method-local generics need javac's attributed AST
+   * (sbt/zinc#145). TODO: once the structured `SignatureParser` planned for classfile-based Java API
+   * extraction lands, replace this scanner with a name-collecting visitor over it so the two parsers
+   * cannot diverge. See docs/design/issue-147-generic-dependencies.md for the scope, the deferrals,
+   * and why this is unit-tested rather than scripted.
+   */
+  private[classfile] def signatureClassTypes(signature: String): List[String] = {
+    val names = new collection.mutable.ListBuffer[String]
+    val length = signature.length
+    var pos = 0
+
+    // An identifier (a type-parameter or type-variable name, or an inner-class simple name) runs
+    // until the next signature metacharacter.
+    def readIdentifier(): String = {
+      val start = pos
+      while (
+        pos < length && {
+          val c = signature.charAt(pos)
+          c != ';' && c != '<' && c != '>' && c != '.' && c != ':' && c != '/' && c != '['
+        }
+      ) pos += 1
+      signature.substring(start, pos)
+    }
+
+    // 'L' (package '/')* SimpleName ('.' InnerName)* ';' , each name optionally followed by type
+    // arguments. The package/name part keeps its '/' separators (converted to dots on the way out);
+    // inner names are joined with '$' to reconstruct the binary name.
+    def parseClassType(): Unit = {
+      pos += 1 // 'L'
+      val nameStart = pos
+      while (
+        pos < length && {
+          val c = signature.charAt(pos)
+          c != ';' && c != '<' && c != '.'
+        }
+      ) pos += 1
+      var binaryName = signature.substring(nameStart, pos)
+      if (binaryName.nonEmpty) names += binaryName
+      var continue = true
+      while (continue && pos < length) {
+        signature.charAt(pos) match {
+          case '<' => parseTypeArguments()
+          case '.' => // inner class: enclosing$Inner
+            pos += 1
+            val inner = readIdentifier()
+            if (inner.nonEmpty) {
+              binaryName = binaryName + "$" + inner
+              names += binaryName
+            }
+          case ';' =>
+            pos += 1
+            continue = false
+          case _ => // tolerate the unexpected rather than throwing: stop this class type
+            continue = false
+        }
+      }
+    }
+
+    // '<' TypeArgument+ '>' ; each argument is a (possibly wildcard-prefixed) reference type.
+    def parseTypeArguments(): Unit = {
+      pos += 1 // '<'
+      while (pos < length && signature.charAt(pos) != '>') {
+        signature.charAt(pos) match {
+          case 'L' => parseClassType()
+          case 'T' => skipTypeVariable()
+          case _   => pos += 1 // '*' / '+' / '-' wildcard markers, '[' array, etc.
+        }
+      }
+      if (pos < length) pos += 1 // '>'
+    }
+
+    // 'T' Identifier ';' — a *use* of a type variable; skip it so its name (which may contain 'L')
+    // is not misread as a class reference.
+    def skipTypeVariable(): Unit = {
+      pos += 1 // 'T'
+      while (pos < length && signature.charAt(pos) != ';') pos += 1
+      if (pos < length) pos += 1 // ';'
+    }
+
+    // One ReferenceTypeSignature at `pos`: a class type, a type-variable use, or an array whose
+    // element is itself a reference (or primitive) type. Used for type-parameter bounds — the array
+    // form is not producible from Java source (arrays are not legal bounds) but is permitted by the
+    // grammar, so handle it rather than dropping its element class.
+    def parseReferenceType(): Unit =
+      if (pos < length) signature.charAt(pos) match {
+        case 'L' => parseClassType()
+        case 'T' => skipTypeVariable()
+        case '[' => pos += 1; parseReferenceType()
+        case _   => pos += 1 // primitive array element
+      }
+
+    // '<' TypeParameter+ '>' at the start of a Class/Method signature, where each TypeParameter is
+    // Identifier (':' ReferenceTypeSignature?)+ . The bound types are real references, but the
+    // parameter *names* are not (and may themselves be 'T'), so they must be consumed as identifiers
+    // and not routed through skipTypeVariable.
+    def parseFormalTypeParameters(): Unit = {
+      pos += 1 // '<'
+      while (pos < length && signature.charAt(pos) != '>') {
+        val before = pos
+        readIdentifier() // parameter name — discarded
+        while (pos < length && signature.charAt(pos) == ':') {
+          pos += 1 // ':'
+          // a bound, if present, is a reference type; an absent class bound (interface-only) leaves
+          // ':' immediately followed by the next ':' or the closing '>'
+          val c = if (pos < length) signature.charAt(pos) else '>'
+          if (c != ':' && c != '>') parseReferenceType()
+        }
+        if (pos == before) pos += 1 // guard against non-progress on malformed input
+      }
+      if (pos < length) pos += 1 // '>'
+    }
+
+    if (pos < length && signature.charAt(pos) == '<') parseFormalTypeParameters()
+    while (pos < length) {
+      signature.charAt(pos) match {
+        case 'L' => parseClassType()
+        case 'T' => skipTypeVariable()
+        case _   => pos += 1
+      }
+    }
+    names.iterator.map(slashesToDots).toList
   }
 }

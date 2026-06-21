@@ -53,6 +53,61 @@ class ParserSpecification extends UnitSpec {
     assert(self.get.outerClassName == "java.util.AbstractMap")
   }
 
+  // sbt/zinc#147: classes that appear only in a generic position survive erasure only in the
+  // Signature attribute. signatureClassTypes recovers them; these cases pin down the parser's
+  // handling of the JVMS 4.7.9 grammar (nested arguments, bounds, wildcards, inner classes, and the
+  // type-variable exclusions a naive `L...;` scan would get wrong).
+  it should "extract class references from generic signatures" in {
+    def types(sig: String): Set[String] = Parser.signatureClassTypes(sig).toSet
+
+    // a class used only as a type argument (the issue's `List<Foo>` example)
+    assert(types("Ljava/util/List<Lp/Foo;>;") == Set("java.util.List", "p.Foo"))
+
+    // method signature: type arguments in both parameter and return position
+    assert(
+      types("(Ljava/util/List<Lp/Foo;>;)Ljava/util/List<Lp/Bar;>;") ==
+        Set("java.util.List", "p.Foo", "p.Bar")
+    )
+
+    // a type-parameter bound (`<T extends Foo>`); the formal parameter name `T` must not be treated
+    // as a type variable and swallow the bound that follows
+    assert(types("<T:Lp/Foo;>Ljava/lang/Object;") == Set("p.Foo", "java.lang.Object"))
+
+    // an interface-only bound (empty class bound) still recovers the interface
+    assert(
+      types("<T::Ljava/lang/Comparable<TT;>;>Ljava/lang/Object;") ==
+        Set("java.lang.Comparable", "java.lang.Object")
+    )
+
+    // nested type arguments
+    assert(
+      types("Ljava/util/Map<Ljava/lang/String;Ljava/util/List<Lp/Foo;>;>;") ==
+        Set("java.util.Map", "java.lang.String", "java.util.List", "p.Foo")
+    )
+
+    // wildcards: extends / super / unbounded
+    assert(types("Ljava/util/List<+Lp/Foo;>;") == Set("java.util.List", "p.Foo"))
+    assert(types("Ljava/util/List<-Lp/Bar;>;") == Set("java.util.List", "p.Bar"))
+    assert(types("Ljava/util/List<*>;") == Set("java.util.List"))
+
+    // arrays of a parameterized type
+    assert(types("[Ljava/util/List<Lp/Foo;>;") == Set("java.util.List", "p.Foo"))
+
+    // an array used as a type argument (`List<Foo[]>`)
+    assert(types("Ljava/util/List<[Lp/Foo;>;") == Set("java.util.List", "p.Foo"))
+
+    // an array used as a type-parameter bound: not expressible in Java source (arrays are not legal
+    // bounds), but valid in the grammar — the element class must still be recovered, not dropped
+    assert(types("<T:[Lp/Foo;>Ljava/lang/Object;") == Set("p.Foo", "java.lang.Object"))
+
+    // inner classes are reconstructed with their binary `$` name, alongside the enclosing class
+    assert(types("Lp/Outer<Lp/Foo;>.Inner;") == Set("p.Outer", "p.Outer$Inner", "p.Foo"))
+
+    // type variables are excluded — even one whose name happens to contain an `L`
+    assert(types("TList;") == Set.empty)
+    assert(types("TT;") == Set.empty)
+  }
+
   it should "parse InnerClasses attribute for AbstractMap" in {
     val logger = ConsoleLogger()
     val c = classOf[java.util.AbstractMap[?, ?]]

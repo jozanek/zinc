@@ -50,6 +50,82 @@ class AnalyzeSpecification extends UnitSpec {
     assert(deps.memberRef("D") === Set.empty)
   }
 
+  // sbt/zinc#147: a class used only as a generic type argument is erased out of the descriptors and
+  // the constant pool, so without scanning the Signature attribute the dependency would be dropped
+  // and a consumer would not be recompiled when the class changes.
+  "Analyze" should "extract dependencies on classes used only as generic type arguments" in {
+    val srcBox =
+      """|public class Box {}
+         |""".stripMargin
+    val srcUser =
+      """|import java.util.List;
+         |public class User {
+         |  List<Box> field;
+         |  public List<Box> method(List<Box> arg) { return arg; }
+         |}
+         |""".stripMargin
+    val deps = JavaCompilerForUnitTesting.extractDependenciesFromSrcs(
+      "Box.java" -> srcBox,
+      "User.java" -> srcUser,
+    )
+    assert(deps.memberRef("User").contains("Box"))
+  }
+
+  // sbt/zinc#147: the bound here appears nowhere in erased form (no member has type T), so it
+  // survives only in the class-level Signature attribute.
+  "Analyze" should "extract dependencies on generic type-parameter bounds" in {
+    val srcBound =
+      """|public class Bound {}
+         |""".stripMargin
+    val srcUser =
+      """|public class User<T extends Bound> {}
+         |""".stripMargin
+    val deps = JavaCompilerForUnitTesting.extractDependenciesFromSrcs(
+      "Bound.java" -> srcBound,
+      "User.java" -> srcUser,
+    )
+    assert(deps.memberRef("User").contains("Bound"))
+  }
+
+  // sbt/zinc#147: the same generic-only reference, but on an EXTERNAL class compiled separately and
+  // resolved off the classpath (not co-compiled). This exercises the binaryDependency path — the
+  // classloader origin lookup that multi-project / library clients (Gradle, Bazel, Maven) rely on —
+  // which is a distinct branch from the co-compiled classDependency case above.
+  "Analyze" should "extract binary dependencies on external classes used only as generic type arguments" in {
+    IO.withTemporaryDirectory { temp =>
+      val depDir = new File(temp, "dep")
+      val useDir = new File(temp, "use")
+      depDir.mkdir()
+      useDir.mkdir()
+
+      val boxFile = new File(temp, "Box.java")
+      IO.write(boxFile, "public class Box {}")
+      JavaCompilerForUnitTesting.compileJava(Seq(boxFile), depDir, Seq.empty)
+
+      val userFile = new File(temp, "User.java")
+      IO.write(
+        userFile,
+        """|import java.util.List;
+           |public class User {
+           |  public List<Box> boxes() { return null; }
+           |}
+           |""".stripMargin
+      )
+      // User compiles against Box on the classpath; Box.class lands in depDir, not useDir.
+      JavaCompilerForUnitTesting.compileJava(Seq(userFile), useDir, Seq(depDir))
+
+      // Analyze only User, with Box resolvable on the analysis classloader (depDir) but not a product.
+      val callback = JavaCompilerForUnitTesting.analyze(useDir, Seq(userFile), Seq(depDir))
+
+      assert(
+        callback.binaryDependencies.exists {
+          case (_, onBinaryName, fromClassName, ctx) =>
+            onBinaryName == "Box" && fromClassName == "User" && ctx == DependencyByMemberRef
+        }
+      )
+    }
+  }
+
   "Analyze" should "process runtime-visible annotations" in {
     val srcTest =
       """|import java.lang.annotation.Retention;

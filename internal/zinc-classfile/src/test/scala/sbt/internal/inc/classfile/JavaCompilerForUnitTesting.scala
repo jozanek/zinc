@@ -119,12 +119,21 @@ object JavaCompilerForUnitTesting {
    * Runs [[JavaAnalyze]] over the class files already present in `classesDir`, mapping them back to
    * the given `srcFiles`. Unlike [[compileJavaSrcs]] this does not compile, so the caller can stage
    * the class files (e.g. compile against one classpath, then swap a dependency) before analysis.
+   *
+   * `classpath` entries are added to the analysis classloader but not analyzed as products, so a
+   * class referenced by (but compiled separately from) `classesDir` is resolvable and gets recorded
+   * as a binary (external) dependency rather than an internal class dependency.
    */
-  def analyze(classesDir: File, srcFiles: Seq[File]): TestCallback = {
+  def analyze(
+      classesDir: File,
+      srcFiles: Seq[File],
+      classpath: Seq[File] = Seq.empty
+  ): TestCallback = {
     val srcs: List[VirtualFile] = srcFiles.toList.map(f => new TestVirtualFile(f.toPath))
     val analysisCallback = new TestCallback
     val classFiles = (sbt.io.PathFinder(classesDir) ** "*.class").get().map(_.toPath)
-    val classloader = new URLClassLoader(Array(classesDir.toURI.toURL), null)
+    val urls = (classesDir +: classpath).map(_.toURI.toURL).toArray
+    val classloader = new URLClassLoader(urls, null)
     val output = new SingleOutput {
       override def getOutputDirectoryAsPath: Path = classesDir.toPath
       override def getOutputDirectory: File = classesDir
